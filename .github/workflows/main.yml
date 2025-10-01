@@ -1,4 +1,3 @@
-.github/workflows/main.yml
 name: Run Telegram Deals Bot
 
 on:
