@@ -1,0 +1,47 @@
+.github/workflows/main.yml
+name: Run Telegram Deals Bot
+
+on:
+schedule:
+# Runs the job every minute
+- cron: '*/1 * * * *'
+workflow_dispatch: # Allows manual triggering from the Actions tab
+
+jobs:
+run-bot:
+runs-on: ubuntu-latest
+
+permissions:
+  contents: write
+
+steps:
+  - name: Checkout repository
+    uses: actions/checkout@v4
+
+  - name: Set up Python
+    uses: actions/setup-python@v5
+    with:
+      python-version: '3.11'
+      cache: 'pip'
+
+  - name: Install dependencies
+    run: pip install -r requirements.txt
+    
+  - name: Ensure processed IDs file exists
+    run: touch processed_message_ids.txt
+
+  - name: Run the bot script
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      SOURCE_CHAT_ID: ${{ secrets.SOURCE_CHAT_ID }}
+      TARGET_CHAT_ID: ${{ secrets.TARGET_CHAT_ID }}
+      AFFILIATE_API_ENDPOINT: ${{ secrets.AFFILIATE_API_ENDPOINT }}
+    run: python bot.py
+
+  - name: Commit processed message IDs
+    run: |
+      git config --global user.name 'github-actions[bot]'
+      git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+      git add processed_message_ids.txt
+      git diff --staged --quiet || git commit -m "Update processed message IDs"
+      git push
