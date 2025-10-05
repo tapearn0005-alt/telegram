@@ -256,8 +256,17 @@ def main_bot_loop():
         print(f"\nCycle complete. Starting next check in {CHECK_INTERVAL_SECONDS} second(s).")
         time.sleep(CHECK_INTERVAL_SECONDS)
 
+# --- ADD THIS NEW CODE AT THE END ---
 if __name__ == "__main__":
+    # Initialize everything first
     initialize_api_keys()
     load_posted_deals()
-    threading.Thread(target=run_flask, daemon=True).start()
-    main_bot_loop()
+
+    # Start the Deal Finder in a background thread
+    print("Starting the main deal finder loop in the background...")
+    deal_thread = threading.Thread(target=main_bot_loop, daemon=True)
+    deal_thread.start()
+
+    # Start the web server to keep the bot alive
+    print("Starting the Flask web server to keep the bot alive...")
+    run_flask()
