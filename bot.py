@@ -1,167 +1,263 @@
 import os
-import re
-import logging
 import requests
-import asyncio
-from telegram import Bot
-from telegram.error import TelegramError
+import time
+import threading
+from flask import Flask
+import telegram
+import json
+import re
+import random
+import math
+import traceback
 
-# --- Configuration ---
-# It's recommended to use environment variables for sensitive data.
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-SOURCE_CHAT_ID = os.environ.get("SOURCE_CHAT_ID") # e.g., -1001234567890
-TARGET_CHAT_ID = os.environ.get("TARGET_CHAT_ID") # e.g., -1009876543210
-AFFILIATE_API_ENDPOINT = os.environ.get("AFFILIATE_API_ENDPOINT") # Your affiliate API endpoint
-PROCESSED_IDS_FILE = 'processed_message_ids.txt'
+# ==============================================================================
+# --- MAIN CONFIGURATION ---
+# ==============================================================================
 
-# --- Logging Setup ---
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# --- General Bot Settings ---
+RAPIDAPI_KEYS_STR = os.environ.get('RAPIDAPI_KEYS', '')
+RAPIDAPI_HOST = "real-time-amazon-data.p.rapidapi.com"
+EARNKARO_API_TOKEN = os.environ.get('EARNKARO_API_TOKEN')
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHANNEL_ID = os.environ.get('TELEGRAM_CHANNEL_ID')
+COUNTRY = os.environ.get('COUNTRY', 'IN')
+POSTED_DEALS_FILE = 'posted_deals.txt'
+CHECK_INTERVAL_SECONDS = 1
+POSTING_WINDOW_SECONDS = 3600
 
-# --- Message Parsing Regex ---
-# This regex is designed to be robust and capture the required fields.
-message_regex = re.compile(
-    r"📦\s*Product:\s*(?P<product_name>.+?)\s*(?:\n💡|\n💰)"
-    r".*?"
-    r"💰\s*Price:\s*₹(?P<before_price>[\d,]+)\s*→\s*₹(?P<after_price>[\d,]+)"
-    r".*?"
-    r"Link:\s*(?P<link>https?://\S+)",
-    re.DOTALL | re.IGNORECASE
-)
+# ==============================================================================
+# --- DEAL QUALITY FILTERS ---
+# ==============================================================================
+MINIMUM_DISCOUNT_PERCENT = 10
+MINIMUM_STAR_RATING = 0.0
+KEYWORD_BLACKLIST = [
+    "egg", "eggs", "vegetable", "paneer", "cauliflower", "marigold",
+    "banana", "gourd", "brinjal", "butter", "farm fresh", "pantry"
+]
 
-def load_processed_ids():
-    """Loads processed message IDs from a file into a set for fast lookups."""
+# --- Category Filtering ---
+SPECIFIC_CATEGORIES_TO_FETCH = [
+    {"name": "Fashion", "id": "2478868012"},
+    {"name": "Home_Kitchen", "id": "976442031"}, # Use underscores for hashtags
+    {"name": "Electronics", "id": "1389432031"},
+    {"name": "Health_PC", "id": "1389436031"},
+    {"name": "Computers", "id": "1389433031"},
+    {"name": "Mobiles", "id": "1389437031"}
+]
+
+# --- System Globals ---
+posted_product_ids = set()
+app = Flask('')
+API_KEYS = []
+current_api_key_index = 0
+
+# ==============================================================================
+# --- HELPER & PARSER FUNCTIONS ---
+# ==============================================================================
+
+def initialize_api_keys():
+    global API_KEYS
+    if RAPIDAPI_KEYS_STR:
+        API_KEYS = [key.strip() for key in RAPIDAPI_KEYS_STR.split(',') if key.strip()]
+    if API_KEYS:
+        print(f"[*] Successfully loaded {len(API_KEYS)} API Key(s).")
+    else:
+        print("!!! CRITICAL WARNING: No RapidAPI keys found.")
+
+def apply_filters(product_data, category_name):
+    title = product_data.get('product_title')
+    if not title: return None
+    title_lower = title.lower()
+    for word in KEYWORD_BLACKLIST:
+        if word in title_lower:
+            print(f"[FILTERED] Skipping '{title[:40]}...' (Blacklisted: '{word}')")
+            return None
     try:
-        with open(PROCESSED_IDS_FILE, 'r') as f:
-            return set(line.strip() for line in f)
-    except FileNotFoundError:
-        return set()
-
-def save_processed_id(message_id):
-    """Appends a new processed message ID to the file."""
-    with open(PROCESSED_IDS_FILE, 'a') as f:
-        f.write(str(message_id) + '\n')
-
-def get_affiliate_link(original_link: str) -> str:
-    """
-    Calls the affiliate API to convert the original link.
-    Returns the original link if the API call fails.
-    """
-    if not AFFILIATE_API_ENDPOINT:
-        logger.warning("AFFILIATE_API_ENDPOINT is not set. Returning original link.")
-        return original_link
-
+        star_rating_str = product_data.get('product_star_rating', '0')
+        star_rating = float(star_rating_str) if star_rating_str else 0
+        if star_rating < MINIMUM_STAR_RATING:
+            print(f"[FILTERED] Skipping '{title[:40]}...' (Rating {star_rating} < {MINIMUM_STAR_RATING})")
+            return None
+    except (ValueError, TypeError): star_rating = 0.0
+    deal_price_str = product_data.get('product_price')
+    original_price_str = product_data.get('product_original_price')
     try:
-        # Example: The API expects a payload like {'url': 'http://...'}
-        payload = {'url': original_link}
-        response = requests.post(AFFILIATE_API_ENDPOINT, json=payload, timeout=10)
-        response.raise_for_status() # Raises an HTTPError for bad responses (4xx or 5xx)
+        deal_price = float(re.sub(r'[^\d.]', '', deal_price_str)) if deal_price_str else 0
+        original_price = float(re.sub(r'[^\d.]', '', original_price_str)) if original_price_str else 0
+        if not original_price or not deal_price or deal_price >= original_price: return None
+        discount = round(((original_price - deal_price) / original_price) * 100)
+        if discount < MINIMUM_DISCOUNT_PERCENT:
+            print(f"[FILTERED] Skipping '{title[:40]}...' (Discount {discount}% < {MINIMUM_DISCOUNT_PERCENT}%)")
+            return None
+    except (ValueError, AttributeError): return None
+    image_url = product_data.get('product_photo')
+    if not all([product_data.get('asin'), image_url, product_data.get('product_url')]): return None
+    return {
+        'product_id': product_data.get('asin'), 'deal_title': title, 'deal_photo': image_url,
+        'product_url': product_data.get('product_url'), 'deal_price': deal_price,
+        'original_price': original_price, 'star_rating': star_rating, 'category_name': category_name,
+        'source': 'Amazon'
+    }
 
-        # Assuming the API returns JSON with a key 'affiliate_link'
-        data = response.json()
-        if 'affiliate_link' in data:
-            logger.info(f"Successfully generated affiliate link for {original_link}")
-            return data['affiliate_link']
-        else:
-            logger.error(f"Affiliate API response missing 'affiliate_link' key for {original_link}")
-            return original_link
-    except requests.RequestException as e:
-        logger.error(f"Affiliate API request failed for {original_link}: {e}")
-        return original_link # Fallback to original link
+def parse_api_response(api_data, category_name):
+    standardized_deals = []
+    products_list = api_data.get('data', {}).get('products', []) or api_data.get('data', {}).get('deals', [])
+    if not isinstance(products_list, list): return []
+    for product in products_list:
+        deal = apply_filters(product, category_name)
+        if deal: standardized_deals.append(deal)
+    return standardized_deals
 
-async def process_message(bot: Bot, message):
-    """Processes a single message, parses it, and forwards the formatted version."""
-    message_id = str(message.message_id)
-    message_text = message.text
+# ==============================================================================
+# --- CORE BOT ENGINE ---
+# ==============================================================================
 
-    if not message_text:
-        return
+@app.route('/')
+def home(): return "The Deal Bot is active and running."
+def run_flask(): app.run(host='0.0.0.0', port=8080)
 
-    processed_ids = load_processed_ids()
-    if message_id in processed_ids:
-        logger.info(f"Skipping already processed message ID: {message_id}")
-        return
-
-    match = message_regex.search(message_text)
-    if not match:
-        logger.warning(f"Message ID {message_id} did not match regex pattern.")
-        return
-
-    # Extract data using regex named groups
-    product_name = match.group('product_name').strip()
-    before_price = match.group('before_price').strip()
-    after_price = match.group('after_price').strip()
-    original_link = match.group('link').strip()
-
-    logger.info(f"Extracted from message {message_id}: {product_name}")
-
-    # Generate Affiliate Link
-    affiliate_link = get_affiliate_link(original_link)
-
-    # Format the final message
-    final_message = (
-        f"📦 **Product:** {product_name}\n"
-        f"💰 **Price:** ₹{before_price} → ₹{after_price}\n"
-        f"🔗 **Affiliate Link:** [Buy Now]({affiliate_link})"
-    )
-
-    # Send the message to the target group
+def load_posted_deals():
     try:
-        await bot.send_message(
-            chat_id=TARGET_CHAT_ID,
-            text=final_message,
-            parse_mode='Markdown',
-            disable_web_page_preview=False
-        )
-        logger.info(f"Successfully forwarded message for '{product_name}' to {TARGET_CHAT_ID}")
-        save_processed_id(message_id)
-    except TelegramError as e:
-        logger.error(f"Failed to send message to {TARGET_CHAT_ID}: {e}")
-
-async def main():
-    """Main function to initialize the bot and check for new messages."""
-    if not all([TELEGRAM_BOT_TOKEN, SOURCE_CHAT_ID, TARGET_CHAT_ID]):
-        logger.critical("Missing one or more required environment variables. Exiting.")
-        return
-
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    processed_ids = load_processed_ids()
-
-    try:
-        # Get the last 50 messages from the source chat
-        # You can adjust the limit based on how frequently your bot runs
-        updates = await bot.get_updates(offset=-50, timeout=10)
-
-        # In a real channel, you might get updates from getChatHistory instead
-        # For simplicity, get_updates works well for recent messages
-        # Note: This is a simple polling mechanism suitable for a cron job.
-        # It doesn't use webhooks.
-
-        # We'll simulate fetching history by looking at recent updates.
-        # A more robust approach might involve `get_chat_history`.
-        # However, `get_updates` is often sufficient and simpler for this use case.
-        # Let's consider a channel post as a 'message' in an update.
-        
-        # This part requires a more complex setup to truly get chat history,
-        # as bots can't easily read arbitrary history in channels they don't own.
-        # Assuming the bot is an admin with rights to read messages.
-        # A common pattern is to use a user bot or have messages forwarded to the bot.
-        # For this script, we'll assume the bot is in a group and can see messages.
-        
-        logger.info(f"Found {len(updates)} recent updates to check.")
-
-        for update in updates:
-            message = update.channel_post or update.message
-            if message and str(message.chat_id) == str(SOURCE_CHAT_ID):
-                 await process_message(bot, message)
-
-    except TelegramError as e:
-        logger.error(f"Error fetching updates from Telegram: {e}")
+        if os.path.exists(POSTED_DEALS_FILE):
+            with open(POSTED_DEALS_FILE, 'r') as f:
+                posted_product_ids.update(line.strip() for line in f)
+            print(f"[*] Loaded {len(posted_product_ids)} previously posted deal IDs.")
     except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}", exc_info=True)
+        print(f"[ERROR] Could not load posted deals file: {e}")
+
+def save_posted_deal(product_id):
+    try:
+        with open(POSTED_DEALS_FILE, 'a') as f:
+            f.write(product_id + '\n')
+    except Exception as e:
+        print(f"[ERROR] Could not save new deal ID to file: {e}")
+
+def escape_markdown(text):
+    if not isinstance(text, str): return ''
+    # This escape function is specifically for Telegram's MarkdownV2
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
+def make_api_request(endpoint, params):
+    global current_api_key_index
+    if not API_KEYS: return None
+    for i in range(len(API_KEYS)):
+        key_index = (current_api_key_index + i) % len(API_KEYS)
+        key = API_KEYS[key_index]
+        headers = {"x-rapidapi-key": key, "x-rapidapi-host": RAPIDAPI_HOST}
+        url = f"https://{RAPIDAPI_HOST}{endpoint}"
+        print(f"[*] Attempting API call to '{endpoint}' with Key #{key_index + 1}...")
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=45)
+            response.raise_for_status()
+            current_api_key_index = key_index
+            return response.json()
+        except Exception as e:
+            print(f"  -> [WARNING] Key #{key_index + 1} failed: {e}. Trying next key...")
+    print(f"[ERROR] All API keys failed for endpoint '{endpoint}'.")
+    return None
+
+def get_amazon_deals():
+    all_deals, found_product_ids = [], set()
+    print("\n--- Searching For Deals in Specific Categories ---")
+    for category in SPECIFIC_CATEGORIES_TO_FETCH:
+        response_data = make_api_request("/products-by-category", {"category_id": category['id'], "page": "1", "country": COUNTRY})
+        if response_data:
+            parsed_deals = parse_api_response(response_data, category['name'])
+            print(f"  -> Found {len(parsed_deals)} valid deals in '{category['name']}'.")
+            new_deals_count = 0
+            for deal in parsed_deals:
+                pid = deal.get('product_id')
+                if pid and pid not in found_product_ids:
+                    all_deals.append(deal)
+                    found_product_ids.add(pid)
+                    new_deals_count += 1
+            if new_deals_count > 0:
+                print(f"  -> Added {new_deals_count} unique new deals from this category.")
+        time.sleep(5)
+    print(f"\n[SUCCESS] Found a total of {len(all_deals)} unique, valid deals.")
+    return all_deals
+
+def create_affiliate_link(url):
+    if not EARNKARO_API_TOKEN or not url: return url
+    try:
+        response = requests.post("https://ekaro-api.affiliaters.in/api/converter/public", 
+            headers={'Authorization': f'Bearer {EARNKARO_API_TOKEN}', 'Content-Type': 'application/json'},
+            data=json.dumps({"deal": url, "convert_option": "convert_only"}), timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("success") == 1 and "data" in data:
+            return "https" + data["data"].split("https", 1)[1].split(" ", 1)[0]
+    except Exception: pass
+    return url
+
+def get_star_emojis(rating):
+    if not rating or rating <= 0: return ""
+    full_stars = math.floor(rating)
+    half_star = "☆" if (rating - full_stars) >= 0.25 else ""
+    empty_stars = 5 - full_stars - (1 if half_star else 0)
+    return f"{'⭐' * full_stars}{half_star}{'✩' * empty_stars} `({rating} Stars)`"
+
+def post_deal_to_telegram(deal):
+    try:
+        bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+        original_price, deal_price = int(deal['original_price']), int(deal['deal_price'])
+        discount = round(((original_price - deal_price) / original_price) * 100)
+
+        # We need to escape the title BEFORE using it in the caption
+        product_name = escape_markdown(deal['deal_title'])
+        affiliate_link = create_affiliate_link(deal['product_url'])
+        rating_line = get_star_emojis(deal.get('star_rating'))
+
+        price_line = f"💰 ~₹{original_price}~  *₹{deal_price}* `({discount}% OFF\\!)`"
+
+        # --- THIS IS THE FIX: The hashtag line has been removed ---
+        caption_parts = [
+            f"🔥 *DEAL ALERT* 🔥",
+            f"*{product_name}*",
+            rating_line,
+            # hashtag_line,  <-- REMOVED
+            price_line,
+            f"🛒 [Buy Now]({affiliate_link})",
+            f"👉 Join @bestsshoppingdeal for more\\!"
+        ]
+        caption = "\n\n".join(filter(None, caption_parts))
+
+        bot.send_photo(chat_id=TELEGRAM_CHANNEL_ID, photo=deal['deal_photo'], caption=caption, parse_mode=telegram.ParseMode.MARKDOWN_V2)
+        print(f"✅ Posted: {deal['deal_title'][:50]}...")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to post deal: {deal.get('deal_title', 'Unknown')}")
+        # Uncomment the line below for extremely detailed error reports if problems continue
+        # traceback.print_exc() 
+        return False
+
+def main_bot_loop():
+    print("Bot loop started. Initial check will run shortly...")
+    while True:
+        print("\n" + "="*50 + "\nRUNNING NEW DEAL CHECK CYCLE\n" + "="*50)
+        all_deals = get_amazon_deals()
+        new_deals = [d for d in all_deals if d.get('product_id') not in posted_product_ids]
+        if not new_deals:
+            print("No new valid deals found that passed all filters.")
+        else:
+            print(f"Found {len(new_deals)} new deals! Starting dynamic posting...")
+            random.shuffle(new_deals)
+            delay = max(1, POSTING_WINDOW_SECONDS / len(new_deals))
+            print(f"Posting one deal every {delay:.1f}s over {POSTING_WINDOW_SECONDS/60:.1f} min.")
+            for deal in new_deals:
+                if post_deal_to_telegram(deal):
+                    pid = deal.get('product_id')
+                    posted_product_ids.add(pid)
+                    save_posted_deal(pid)
+                time.sleep(delay)
+            print("Finished posting all new deals for this cycle.")
+
+        print(f"\nCycle complete. Starting next check in {CHECK_INTERVAL_SECONDS} second(s).")
+        time.sleep(CHECK_INTERVAL_SECONDS)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    initialize_api_keys()
+    load_posted_deals()
+    threading.Thread(target=run_flask, daemon=True).start()
+    main_bot_loop()
